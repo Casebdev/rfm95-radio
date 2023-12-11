@@ -9,6 +9,72 @@
 //     together to simplify things since we are only interested in the
 //     RFM95 device. 
 //
+// Extracted from code originally developed by:
+//
+// Author: Mike McCauley (mikem@airspayce.com)
+// Copyright (C) 2014 Mike McCauley
+// $Id: RH_RF95.h,v 1.26 2020/06/15 23:39:39 mikem Exp $
+//
+// Pin connections
+//
+//                 Arduino      RFM95
+//                 GND----------GND   (ground in)
+//                 3V3----------3.3V  (3.3V in)
+// interrupt 0 pin D2-----------DIO0  (interrupt request out)
+//          SS pin D10----------NSS   (CS chip select in)
+//         SCK pin D13----------SCK   (SPI clock in)
+//        MOSI pin D11----------MOSI  (SPI Data in)
+//        MISO pin D12----------MISO  (SPI Data out)
+//
+//
+// All messages sent and received by this Driver conform to this packet format:
+//
+// - LoRa mode:
+// - 8 symbol PREAMBLE
+// - Explicit header with header CRC (default CCITT, handled internally by the radio)
+// - 4 octets HEADER: (TO, FROM, ID, FLAGS)
+// - 0 to 251 octets DATA 
+// - CRC (default CCITT, handled internally by the radio)
+//
+//  Memory
+//
+// The RH_RF95 driver requires non-trivial amounts of memory. The sample
+// programs all compile to about 8kbytes each, which will fit in the
+// flash proram memory of most Arduinos. However, the RAM requirements are
+// more critical. Therefore, you should be vary sparing with RAM use in
+// programs that use the RH_RF95 driver.
+//
+// It is often hard to accurately identify when you are hitting RAM limits on Arduino. 
+// The symptoms can include:
+// - Mysterious crashes and restarts
+// - Changes in behaviour when seemingly unrelated changes are made (such as adding print() statements)
+// - Hanging
+// - Output from Serial.print() not appearing
+//
+// Range
+//
+// We have made some simple range tests under the following conditions:
+// - rf95_client base station connected to a VHF discone antenna at 8m height above ground
+// - rf95_server mobile connected to 17.3cm 1/4 wavelength antenna at 1m height, no ground plane.
+// - Both configured for 13dBm, 434MHz, Bw = 125 kHz, Cr = 4/8, Sf = 4096chips/symbol, CRC on. Slow+long range
+// - Minimum reported RSSI seen for successful comms was about -91
+// - Range over flat ground through heavy trees and vegetation approx 2km.
+// - At 20dBm (100mW) otherwise identical conditions approx 3km.
+// - At 20dBm, along salt water flat sandy beach, 3.2km.
+//
+// It should be noted that at this data rate, a 12 octet message takes 2 seconds to transmit.
+//
+// At 20dBm (100mW) with Bw = 125 kHz, Cr = 4/5, Sf = 128chips/symbol, CRC on. 
+// (Default medium range) in the conditions described above.
+// - Range over flat ground through heavy trees and vegetation approx 2km.
+//
+// Caution: the performance of this radio, especially with narrow bandwidths is strongly dependent on the
+// accuracy and stability of the chip clock. HopeRF and Semtech do not appear to 
+// recommend bandwidths of less than 62.5 kHz 
+// unless you have the optional Temperature Compensated Crystal Oscillator (TCXO) installed and 
+// enabled on your radio module. See the refernece manual for more data.
+// Also https://lowpowerlab.com/forum/rf-range-antennas-rfm69-library/lora-library-experiences-range/15/
+// and http://www.semtech.com/images/datasheet/an120014-xo-guidance-lora-modulation.pdf
 // ***************************************************************************
 
 #include<mwj_rfm95.h>
@@ -19,11 +85,11 @@ RH_RF95* RH_RF95::_deviceForInterrupt=0;
 PROGMEM static const RH_RF95::ModemConfig MODEM_CONFIG_TABLE[] =
 	{
 		//  1d,     1e,      26
-		{ 0x72,   0x74,    0x04}, // Bw125Cr45Sf128 (the chip default), AGC enabled
-		{ 0x92,   0x74,    0x04}, // Bw500Cr45Sf128, AGC enabled
-		{ 0x48,   0x94,    0x04}, // Bw31_25Cr48Sf512, AGC enabled
-		{ 0x78,   0xc4,    0x0c}, // Bw125Cr48Sf4096, AGC enabled
-		{ 0x72,   0xb4,    0x04}, // Bw125Cr45Sf2048, AGC enabled
+		{ 0x72,   0x74,    0x04}, 	// Bw125Cr45Sf128 (the chip default), AGC enabled
+		{ 0x92,   0x74,    0x04}, 	// Bw500Cr45Sf128, AGC enabled
+		{ 0x48,   0x94,    0x04}, 	// Bw31_25Cr48Sf512, AGC enabled
+		{ 0x78,   0xc4,    0x0c}, 	// Bw125Cr48Sf4096, AGC enabled
+		{ 0x72,   0xb4,    0x04}, 	// Bw125Cr45Sf2048, AGC enabled
     
 	};
 
@@ -63,25 +129,23 @@ bool RH_RF95::init()
 
 	_deviceForInterrupt=this;
 
-    //initialize the SPI system
+
+
+	//Set up interrupts from the RFM95 device. 
+	//Set the pin a digital input, determine the associated interrupt number, attach an interrupt service routine
+    if (_interruptPin == RH_INVALID_PIN) return false;
+		
+	pinMode(_interruptPin, INPUT);
+	interruptNumber=digitalPinToInterrupt(_interruptPin);
+	if(interruptNumber==-1) return false;
+	attachInterrupt(interruptNumber,isr0,RISING);
+   
+    //Initialize the SPI system. We will use SPI within the RFM95 interrupts
     spiInit();
+	spiUsingInterrupt(interruptNumber);
+    interrupts();
 
-	// Determine the interrupt number that corresponds to the interruptPin
-    if (_interruptPin != RH_INVALID_PIN)
-		{
-		interruptNumber=digitalPinToInterrupt(_interruptPin);
-		if(interruptNumber==-1) return false;
-		pinMode(_interruptPin, INPUT); 
-	    attachInterrupt(interruptNumber,isr0,RISING);
-
-		// Tell the low level SPI interface we will use SPI within this interrupt
-		spiUsingInterrupt(interruptNumber);
-        interrupts();
-		}
-    else 
-       return false;
-
-    // Set sleep mode, so we can also set LORA mode:
+    // Set device to sleep mode and configure into LORA mode:
 	// Wait for sleep mode to take over from say, CAD
     spiWrite(RH_RF95_REG_01_OP_MODE, RH_RF95_MODE_SLEEP | RH_RF95_LONG_RANGE_MODE);
     delay(10); 
@@ -809,75 +873,6 @@ uint8_t RH_RF95::getDeviceVersion()
 	}
 
 
-
-bool RH_RF95::spiInit(void)
-	{
-    SPI.begin();
-
-	//initialize the slave select
-	pinMode(_slaveSelectPin, OUTPUT);
-    deselectSlave();
-    delay(100);
-    return true;
-	}
-
-
-uint8_t RH_RF95::spiRead(uint8_t reg)
-	{
-    uint8_t val = 0;
-
-	noInterrupts();
-
-    SPI.beginTransaction(SPISettings(SPIFREQ, SPIORDER,SPIMODE));
-    selectSlave();
-    SPI.transfer(reg & ~RH_SPI_WRITE_MASK); // Send the address with the write mask off
-    val=SPI.transfer(0); 					// The written value is ignored, reg value is read
-    deselectSlave();
-    SPI.endTransaction();
-
-	interrupts();
-    return val;
-	}
-
-uint8_t RH_RF95::spiWrite(uint8_t reg, uint8_t val)
-	{
-    uint8_t status = 0;
-
-	noInterrupts();
-
-    SPI.beginTransaction(SPISettings(SPIFREQ, SPIORDER,SPIMODE));
-    selectSlave();
-    status=SPI.transfer(reg | RH_SPI_WRITE_MASK); 	// Send the address with the write mask on
-    SPI.transfer(val); 								// New value follows
-
-    delayMicroseconds(1);
-    deselectSlave();
-
-    SPI.endTransaction();
-
-	interrupts();
-    return status;
-	}
-
-
-uint8_t RH_RF95::spiBurstRead(uint8_t reg, uint8_t* dest, uint8_t len)
-	{
-    uint8_t status = 0;
-
-	noInterrupts();
-
-    SPI.beginTransaction(SPISettings(SPIFREQ, SPIORDER,SPIMODE));
-    selectSlave();
-    status = SPI.transfer(reg & ~RH_SPI_WRITE_MASK); // Send the start address with the write mask off
-    while (len--) *dest++ = SPI.transfer(0);
-    deselectSlave();
-    SPI.endTransaction();
-
-	interrupts();
-    return status;
-	}
-
-
 uint8_t RH_RF95::spiBurstWrite(uint8_t reg, const uint8_t* src, uint8_t len)
 	{
     uint8_t status = 0;
@@ -1072,6 +1067,83 @@ void RH_RF95::setCADTimeout(unsigned long cad_timeout)
 {
     _cad_timeout = cad_timeout;
 }
+
+
+// ***************************************************************************
+//
+//   SPI Routines - Arduino hardware API
+//   
+//   These are independent of the RFM95 stuff
+//
+// ***************************************************************************
+
+bool RH_RF95::spiInit(void)
+	{
+    SPI.begin();
+
+	//initialize the slave select
+	pinMode(_slaveSelectPin, OUTPUT);
+    deselectSlave();
+    delay(100);
+    return true;
+	}
+
+
+uint8_t RH_RF95::spiRead(uint8_t reg)
+	{
+    uint8_t val = 0;
+
+	noInterrupts();
+
+    SPI.beginTransaction(SPISettings(SPIFREQ, SPIORDER,SPIMODE));
+    selectSlave();
+    SPI.transfer(reg & ~RH_SPI_WRITE_MASK); // Send the address with the write mask off
+    val=SPI.transfer(0); 					// The written value is ignored, reg value is read
+    deselectSlave();
+    SPI.endTransaction();
+
+	interrupts();
+    return val;
+	}
+
+
+uint8_t RH_RF95::spiWrite(uint8_t reg, uint8_t val)
+	{
+    uint8_t status = 0;
+
+	noInterrupts();
+
+    SPI.beginTransaction(SPISettings(SPIFREQ, SPIORDER,SPIMODE));
+    selectSlave();
+    status=SPI.transfer(reg | RH_SPI_WRITE_MASK); 	// Send the address with the write mask on
+    SPI.transfer(val); 								// New value follows
+
+    delayMicroseconds(1);
+    deselectSlave();
+
+    SPI.endTransaction();
+
+	interrupts();
+    return status;
+	}
+
+
+uint8_t RH_RF95::spiBurstRead(uint8_t reg, uint8_t* dest, uint8_t len)
+	{
+    uint8_t status = 0;
+
+	noInterrupts();
+
+    SPI.beginTransaction(SPISettings(SPIFREQ, SPIORDER,SPIMODE));
+    selectSlave();
+    status = SPI.transfer(reg & ~RH_SPI_WRITE_MASK); // Send the start address with the write mask off
+    while (len--) *dest++ = SPI.transfer(0);
+    deselectSlave();
+    SPI.endTransaction();
+
+	interrupts();
+    return status;
+	}
 
 
 
